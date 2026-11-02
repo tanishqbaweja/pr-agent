@@ -922,19 +922,38 @@ class GiteaProvider(GitProvider):
                 pr_number=self.pr_number
             )
 
-    def publish_labels(self, labels: list[int]) -> bool:
-        """Publish labels to the PR"""
-        if not labels:
-            self.logger.error("No labels provided to publish")
-            return True
-
+    def publish_labels(self, labels: list[str]) -> bool:
+        """Set the PR labels to the given set: remove the other labels, then add the missing ones"""
+        issue_number = self.pr_number if self.enabled_pr else self.issue_number
+        response = None
         try:
-            response = self.repo_api.add_labels(
+            current_labels = self.repo_api.get_issue_labels(
                 owner=self.owner,
                 repo=self.repo,
-                issue_number=self.pr_number if self.enabled_pr else self.issue_number,
-                labels=labels
+                issue_number=issue_number
             )
+            if not isinstance(current_labels, list):
+                self.logger.error("Failed to publish labels: the current labels could not be read")
+                return False
+            # Not a replace (PUT): before 1.23, Gitea resolves label names in the repository only,
+            # and a PUT drops the organization labels it cannot resolve.
+            for label in current_labels:
+                if label.name not in labels:
+                    self.repo_api.remove_label(
+                        owner=self.owner,
+                        repo=self.repo,
+                        issue_number=issue_number,
+                        label_id=label.id
+                    )
+            current_names = {label.name for label in current_labels}
+            missing_names = [name for name in labels if name not in current_names]
+            if missing_names:
+                response = self.repo_api.add_labels(
+                    owner=self.owner,
+                    repo=self.repo,
+                    issue_number=issue_number,
+                    labels=missing_names
+                )
         except ApiException as e:
             self.logger.error(f"Failed to publish labels: {e}")
             return False
@@ -1406,7 +1425,7 @@ class RepoApi(giteapy.RepositoryApi):
             auth_settings=['AuthorizationHeaderToken']
         )
 
-    def add_labels(self, owner: str, repo: str, issue_number: int, labels: list[int]):
+    def add_labels(self, owner: str, repo: str, issue_number: int, labels: list[str]):
         body = {
             "labels": labels
         }
@@ -1415,6 +1434,14 @@ class RepoApi(giteapy.RepositoryApi):
             repo=repo,
             index=issue_number,
             body=body
+        )
+
+    def remove_label(self, owner: str, repo: str, issue_number: int, label_id: int):
+        return self.issue.issue_remove_label(
+            owner=owner,
+            repo=repo,
+            index=issue_number,
+            id=label_id
         )
 
     def get_pr_commits(self, owner: str, repo: str, pr_number: int):

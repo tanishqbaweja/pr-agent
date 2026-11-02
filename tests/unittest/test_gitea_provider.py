@@ -301,11 +301,36 @@ def test_gitea_publish_description_raises_when_update_returns_no_response():
         provider.publish_description("AI title", "Updated description")
 
 
+def _serve_issue_labels(request, labels, *, rejected=None):
+    """Answer the giteapy HTTP layer like Gitea's issue label endpoints; `rejected` is a method to fail."""
+    def respond(method, url, **kwargs):
+        if method == rejected:
+            return _guidance_response(b'{"message": "rejected"}', status=422, reason="Unprocessable Entity")
+        if method == "GET":
+            return _guidance_response(json.dumps(labels).encode())
+        if method == "DELETE":
+            return _guidance_response(status=204)
+        return _guidance_response(b"[]")
+
+    request.side_effect = respond
+
+
+def _label_requests(request):
+    """The method, path and JSON body of each request the giteapy client sent."""
+    return [
+        (c.args[0], urlsplit(c.args[1]).path, json.loads(c.kwargs["body"]) if c.kwargs.get("body") else None)
+        for c in request.call_args_list
+    ]
+
+
 class TestGiteaProviderLabels:
+    LABELS_PATH = "/api/v1/repos/owner/repo/issues/1/labels"
+
     @pytest.fixture
     def provider(self):
         provider = GiteaProvider.__new__(GiteaProvider)
         provider.repo_api = MagicMock()
+        provider.repo_api.get_issue_labels.return_value = []
         provider.owner = "owner"
         provider.repo = "repo"
         provider.pr_number = 1
@@ -314,10 +339,6 @@ class TestGiteaProviderLabels:
         provider.pr = SimpleNamespace(labels=[])
         provider.logger = MagicMock()
         return provider
-
-    def test_publish_labels_empty_input_is_a_noop(self, provider):
-        assert provider.publish_labels([]) is True
-        provider.repo_api.add_labels.assert_not_called()
 
     @pytest.mark.parametrize("response", [[SimpleNamespace(name="Bug fix")], [], None])
     def test_publish_labels_acknowledges_nonraising_sdk_completion(self, provider, response):
@@ -340,6 +361,58 @@ class TestGiteaProviderLabels:
 
         with pytest.raises(RuntimeError, match="unexpected failure"):
             provider.publish_labels(["Bug fix"])
+
+    def test_publish_labels_removes_stale_labels_by_id_then_adds_the_missing_names(self, provider, guidance_raw_api):
+        provider.repo_api, request = guidance_raw_api
+        _serve_issue_labels(request, [
+            # An organization label that stays in the set: it is neither removed nor sent again.
+            {"id": 3, "name": "team-backend", "url": "http://localhost:3000/api/v1/orgs/owner/labels/3"},
+            {"id": 11, "name": "Review effort 2/5"},
+            {"id": 12, "name": "Possible security concern"},
+        ])
+
+        assert provider.publish_labels(["Review effort 4/5", "team-backend"]) is True
+
+        assert _label_requests(request) == [
+            ("GET", self.LABELS_PATH, None),
+            ("DELETE", f"{self.LABELS_PATH}/11", None),
+            ("DELETE", f"{self.LABELS_PATH}/12", None),
+            ("POST", self.LABELS_PATH, {"labels": ["Review effort 4/5"]}),
+        ]
+
+    def test_publish_labels_with_an_empty_set_removes_every_label(self, provider, guidance_raw_api):
+        provider.repo_api, request = guidance_raw_api
+        _serve_issue_labels(request, [{"id": 11, "name": "Review effort 2/5"}, {"id": 12, "name": "Bug fix"}])
+
+        assert provider.publish_labels([]) is True
+
+        assert _label_requests(request) == [
+            ("GET", self.LABELS_PATH, None),
+            ("DELETE", f"{self.LABELS_PATH}/11", None),
+            ("DELETE", f"{self.LABELS_PATH}/12", None),
+        ]
+
+    @pytest.mark.parametrize("labels,rejected", [([{"id": 12, "name": "Bug fix"}], "GET"), (None, None)],
+                             ids=["rejected-read", "null-read"])
+    def test_publish_labels_writes_nothing_when_the_labels_cannot_be_read(self, provider, guidance_raw_api,
+                                                                          labels, rejected):
+        provider.repo_api, request = guidance_raw_api
+        _serve_issue_labels(request, labels, rejected=rejected)
+
+        assert provider.publish_labels(["Enhancement"]) is False
+
+        assert _label_requests(request) == [("GET", self.LABELS_PATH, None)]
+
+    def test_publish_labels_reports_a_failed_removal(self, provider, guidance_raw_api):
+        provider.repo_api, request = guidance_raw_api
+        _serve_issue_labels(request, [{"id": 11, "name": "Review effort 2/5"}], rejected="DELETE")
+
+        assert provider.publish_labels(["Review effort 4/5"]) is False
+
+        assert _label_requests(request) == [
+            ("GET", self.LABELS_PATH, None),
+            ("DELETE", f"{self.LABELS_PATH}/11", None),
+        ]
 
     @pytest.mark.parametrize("update,payload,expected", [
         (False, [], []),
